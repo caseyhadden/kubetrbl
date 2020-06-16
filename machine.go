@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/caseyhadden/kubetrbl/fsm"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -31,9 +31,14 @@ type Kubetrbl struct {
 	k8sClient *kubernetes.Clientset
 	namespace string
 
-	config *rest.Config
-	pods   *corev1.PodList
-	pod    corev1.Pod
+	config        *rest.Config
+	svc           corev1.Service
+	svcPort       corev1.ServicePort
+	controller    *appsv1.Deployment
+	containerPort corev1.ContainerPort
+	podList       []corev1.Pod
+	podPort       corev1.ContainerPort
+	pods          *corev1.PodList
 }
 
 func NewKubetrbl() *Kubetrbl {
@@ -58,8 +63,12 @@ func NewKubetrbl() *Kubetrbl {
 	machine.Register("checkPendingPods", fsm.State{Enter: k.checkPendingPods})
 	machine.Register("checkRunningPods", fsm.State{Enter: k.checkRunningPods})
 	machine.Register("checkReadyPods", fsm.State{Enter: k.checkReadyPods})
-	machine.Register("getPodName", fsm.State{Enter: k.getPodName})
-	machine.Register("getPort", fsm.State{Enter: k.getPort})
+	machine.Register("getServiceName", fsm.State{Enter: k.getServiceName})
+	machine.Register("getServicePort", fsm.State{Enter: k.getServicePort})
+	machine.Register("getControllerWorkload", fsm.State{Enter: k.getControllerWorkload})
+	machine.Register("getContainerPort", fsm.State{Enter: k.getContainerPort})
+	machine.Register("getControllerPods", fsm.State{Enter: k.getControllerPods})
+	machine.Register("validateContainerPort", fsm.State{Enter: k.validateContainerPort})
 
 	k.fsm = machine
 
@@ -118,19 +127,16 @@ func (k *Kubetrbl) getNamespace() error {
 	if err != nil {
 		return err
 	}
+	fmt.Println("Available namespaces:")
 	for i, nm := range nms.Items {
 		fmt.Println(strconv.Itoa(i) + ") " + nm.GetName())
 	}
-	fmt.Println("Choose the Kubernetes namespace of interest: ")
-	answer, err := k.readString()
+	fmt.Printf("Kubernetes namespace? ")
+	answer, err := k.readInt()
 	if err != nil {
 		return err
 	}
-	s, err := strconv.Atoi(answer)
-	if err != nil {
-		return err
-	}
-	k.namespace = nms.Items[s].GetName()
+	k.namespace = nms.Items[answer].GetName()
 	k.fsm.Change("countPods")
 	return nil
 }
@@ -148,15 +154,14 @@ func (k *Kubetrbl) countPods() error {
 
 func (k *Kubetrbl) checkPendingPods() error {
 	for _, pod := range k.pods.Items {
-		fmt.Println(pod.GetName())
 		status := pod.Status
 		if status.Phase == corev1.PodPending {
-			fmt.Println("### Pending - " + pod.GetName())
+			fmt.Println("\u2717 Pending - " + pod.GetName())
 			// TODO transition to pending checks
 			return nil
 		}
 	}
-	fmt.Println("No pods are pending.")
+	fmt.Println("\u2713 No pods are pending.")
 	k.fsm.Change("checkRunningPods")
 	return nil
 }
@@ -170,7 +175,7 @@ func (k *Kubetrbl) checkRunningPods() error {
 			return nil
 		}
 	}
-	fmt.Println("All pods are running.")
+	fmt.Println("\u2713 All pods are running.")
 	k.fsm.Change("checkReadyPods")
 	return nil
 }
@@ -186,60 +191,95 @@ func (k *Kubetrbl) checkReadyPods() error {
 			}
 		}
 	}
-	fmt.Println("All pods are ready.")
-	k.fsm.Change("getPodName")
+	fmt.Println("\u2713 All pods are ready.")
+	//k.fsm.Change("getPodName")
+	k.fsm.Change("getServiceName")
 	return nil
 }
 
-func (k *Kubetrbl) getPodName() error {
-	fmt.Println("Which pod are we investigating? ")
-	podName, err := k.readString()
+func (k *Kubetrbl) getServiceName() error {
+	svcs, err := k.k8sClient.CoreV1().Services(k.namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
 
-	results := []corev1.Pod{}
-	for _, pod := range k.pods.Items {
-		if strings.Contains(pod.GetName(), podName) {
-			results = append(results, pod)
-		}
+	fmt.Println("Available services: ")
+	for i, s := range svcs.Items {
+		fmt.Println(strconv.Itoa(i) + ") " + s.GetName())
 	}
 
-	if len(results) == 0 {
-		return errors.New("no results for search, try again")
-	} else if len(results) > 1 {
-		return errors.New("too many results, " + strconv.Itoa(len(results)) + ", try again.")
+	fmt.Printf("Which service? ")
+	answer, err := k.readInt()
+	if err != nil {
+		return err
 	}
 
-	fmt.Println("Found pod...")
-	k.pod = results[0]
-	k.fsm.Change("getPort")
+	k.svc = svcs.Items[answer]
+
+	k.fsm.Change("getServicePort")
 	return nil
 }
 
-func (k *Kubetrbl) getPort() error {
-	portNum := 0
-	result := []corev1.ContainerPort{}
-	for _, cnt := range k.pod.Spec.Containers {
-		for _, port := range cnt.Ports {
-			fmt.Println(strconv.Itoa(portNum) + ") " + port.Name + ":" + strconv.Itoa(int(port.ContainerPort)))
-			result = append(result, port)
-			portNum++
+func (k *Kubetrbl) getServicePort() error {
+	fmt.Println("Available ports: ")
+	for i, p := range k.svc.Spec.Ports {
+		fmt.Println(strconv.Itoa(i) + ") " + p.Name)
+	}
+
+	fmt.Printf("Which port? ")
+	answer, err := k.readInt()
+	if err != nil {
+		return err
+	}
+
+	k.svcPort = k.svc.Spec.Ports[answer]
+	k.fsm.Change("getControllerWorkload")
+	return nil
+}
+
+func (k *Kubetrbl) getControllerWorkload() error {
+	k8sName := k.svc.Spec.Selector["app.kubernetes.io/name"]
+	deployment, err := k.k8sClient.AppsV1().Deployments(k.namespace).Get(context.TODO(), k8sName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	k.controller = deployment
+	fmt.Println("\u2713 Found backing Deployment - " + k.controller.GetName())
+	k.fsm.Change("getContainerPort")
+	return nil
+}
+
+func (k *Kubetrbl) getContainerPort() error {
+	tgt := k.svcPort.TargetPort.StrVal
+	for _, cnt := range k.controller.Spec.Template.Spec.Containers {
+		for _, p := range cnt.Ports {
+			if tgt == p.Name {
+				k.containerPort = p
+				break
+			}
 		}
 	}
-	fmt.Println("Select the port: ")
-	answer, err := k.readString()
-	if err != nil {
-		return err
+	fmt.Println("\u2713 Identified pod port: " + strconv.Itoa(int(k.containerPort.ContainerPort)))
+	k.fsm.Change("getControllerPods")
+	return nil
+}
+
+func (k *Kubetrbl) getControllerPods() error {
+	// our target is based off the controller
+	tgt := k.controller.Labels["app.kubernetes.io/name"]
+	result := []corev1.Pod{}
+	for _, p := range k.pods.Items {
+		pos := p.Labels["app.kubernetes.io/name"]
+		if tgt == pos {
+			result = append(result, p)
+		}
 	}
+	k.podList = result
+	k.fsm.Change("validateContainerPort")
+	return nil
+}
 
-	selection, err := strconv.Atoi(answer)
-	if err != nil {
-		return err
-	}
-
-	p := result[selection]
-
+func (k *Kubetrbl) validateContainerPort() error {
 	// TODO this hack matches that in k8s.io/kubectl/pkg/cmd/util/kubectl_match_version.go
 	if nil == k.config.GroupVersion {
 		k.config.GroupVersion = &schema.GroupVersion{Group: "", Version: "v1"}
@@ -260,44 +300,56 @@ func (k *Kubetrbl) getPort() error {
 	if err != nil {
 		return err
 	}
-	req := client.Post().
-		Resource("pods").
-		Namespace(k.namespace).
-		Name(k.pod.Name).
-		SubResource("portforward")
 
-	transport, upgrader, err := spdy.RoundTripperFor(k.config)
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", req.URL())
-	stopChan := make(chan struct{}, 1)
-	readyChan := make(chan struct{})
-	pf, err := portforward.New(
-		dialer,
-		[]string{fmt.Sprintf("%d:%d", 8080, p.ContainerPort)}, // TODO retrieve local port from user
-		stopChan,
-		readyChan,
-		os.Stdout,
-		os.Stderr,
-	)
-	if err != nil {
-		return err
+	for _, pod := range k.podList {
+		fmt.Printf("Checking accessibility of port for pod '%s'.\n", pod.Name)
+		req := client.Post().
+			Resource("pods").
+			Namespace(k.namespace).
+			Name(pod.Name).
+			SubResource("portforward")
+
+		// TODO retrieve local port from user
+		portMapping := []string{fmt.Sprintf("%d:%d", 8080, k.containerPort.ContainerPort)}
+
+		transport, upgrader, err := spdy.RoundTripperFor(k.config)
+		dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", req.URL())
+		stopChan := make(chan struct{}, 1)
+		readyChan := make(chan struct{})
+		pf, err := portforward.New(
+			dialer,
+			portMapping,
+			stopChan,
+			readyChan,
+			os.Stdout,
+			os.Stderr,
+		)
+		if err != nil {
+			return err
+		}
+
+		doneChan := make(chan error)
+		go func() {
+			doneChan <- pf.ForwardPorts()
+		}()
+		<-pf.Ready
+
+		// TODO retrieve path from user
+		resp, err := http.DefaultClient.Get("http://localhost:8080/internal/metrics")
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode < 400 {
+			fmt.Println("\u2713 Pod port accessible.")
+		} else {
+			// TODO transition to failure state
+			fmt.Println("\u2717 Pod port inaccessible.")
+		}
+
+		close(stopChan)
+
 	}
-
-	doneChan := make(chan error)
-	go func() {
-		doneChan <- pf.ForwardPorts()
-	}()
-	<-pf.Ready
-
-	// TODO retrieve path from user
-	resp, err := http.DefaultClient.Get("http://localhost:8080/internal/metrics")
-	if err != nil {
-		return err
-	}
-	fmt.Println(resp.Status)
-	fmt.Println(resp.Header)
-
-	close(stopChan)
-
+	k.fsm.Change("finish")
 	return nil
 }
 
@@ -307,4 +359,12 @@ func (k *Kubetrbl) readString() (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(str), nil
+}
+
+func (k *Kubetrbl) readInt() (int, error) {
+	str, err := k.readString()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(str)
 }
