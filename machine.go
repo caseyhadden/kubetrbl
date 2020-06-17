@@ -13,25 +13,16 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/deprecated/scheme"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
 )
 
 type Kubetrbl struct {
-	fsm    *fsm.FSM
-	reader *bufio.Reader
-	err    error
+	fsm        *fsm.FSM
+	reader     *bufio.Reader
+	k8sContext *K8sContext
 
-	cfg       string
-	k8sClient *kubernetes.Clientset
-	namespace string
-
-	config        *rest.Config
 	svc           corev1.Service
 	svcPort       corev1.ServicePort
 	controller    *appsv1.Deployment
@@ -75,6 +66,7 @@ func NewKubetrbl() *Kubetrbl {
 	return k
 }
 
+// Start initialized our state machine and sets us to the first state
 func (k *Kubetrbl) Start() {
 	k.fsm.Change("welcome")
 }
@@ -100,21 +92,13 @@ func (k *Kubetrbl) getKubeConfig() error {
 	if err != nil {
 		return err
 	}
-	k.cfg = cfg
+	k.k8sContext = NewK8sContext(cfg)
 	k.fsm.Update()
 	return nil
 }
 
 func (k *Kubetrbl) createK8sClient() error {
-	// use the current context in kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", k.cfg)
-	if err != nil {
-		return err
-	}
-	k.config = config
-
-	// create the clientset
-	k.k8sClient, err = kubernetes.NewForConfig(config)
+	err := k.k8sContext.InitClient()
 	if err != nil {
 		return err
 	}
@@ -123,82 +107,91 @@ func (k *Kubetrbl) createK8sClient() error {
 }
 
 func (k *Kubetrbl) getNamespace() error {
-	nms, err := k.k8sClient.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
+	nms, err := k.k8sContext.getNamespaces()
 	if err != nil {
 		return err
 	}
 	fmt.Println("Available namespaces:")
-	for i, nm := range nms.Items {
-		fmt.Println(strconv.Itoa(i) + ") " + nm.GetName())
+	for i, nm := range nms {
+		fmt.Println(strconv.Itoa(i) + ") " + nm)
 	}
 	fmt.Printf("Kubernetes namespace? ")
 	answer, err := k.readInt()
 	if err != nil {
 		return err
 	}
-	k.namespace = nms.Items[answer].GetName()
+	k.k8sContext.namespace = nms[answer]
 	k.fsm.Change("countPods")
 	return nil
 }
 
 func (k *Kubetrbl) countPods() error {
-	pods, err := k.k8sClient.CoreV1().Pods(k.namespace).List(context.TODO(), metav1.ListOptions{})
+	pods, err := k.k8sContext.GetPods()
 	if err != nil {
 		return err
 	}
-	fmt.Printf("There are %d pods in the cluster+namespace.\n", len(pods.Items))
-	k.pods = pods
+	fmt.Printf("There are %d pods in the cluster+namespace.\n", len(pods))
 	k.fsm.Change("checkPendingPods")
 	return nil
 }
 
 func (k *Kubetrbl) checkPendingPods() error {
-	for _, pod := range k.pods.Items {
-		status := pod.Status
-		if status.Phase == corev1.PodPending {
-			fmt.Println("\u2717 Pending - " + pod.GetName())
-			// TODO transition to pending checks
-			return nil
-		}
+	pendingPods, err := k.k8sContext.GetPendingPods()
+	if err != nil {
+		return err
 	}
-	fmt.Println("\u2713 No pods are pending.")
-	k.fsm.Change("checkRunningPods")
+
+	if len(pendingPods) > 0 {
+		for _, p := range pendingPods {
+			fmt.Println("\u2717 Pending - " + p)
+		}
+		// TODO transition for pending pods
+	} else {
+		fmt.Println("\u2713 No pods are pending.")
+		k.fsm.Change("checkRunningPods")
+	}
+
 	return nil
 }
 
 func (k *Kubetrbl) checkRunningPods() error {
-	for _, pod := range k.pods.Items {
-		status := pod.Status
-		if status.Phase != corev1.PodRunning {
-			fmt.Println("### Not running - " + pod.GetName())
-			// TODO transition to not running checks
-			return nil
-		}
+	nonrunningPods, err := k.k8sContext.GetNonrunningPods()
+	if err != nil {
+		return err
 	}
-	fmt.Println("\u2713 All pods are running.")
-	k.fsm.Change("checkReadyPods")
+
+	if len(nonrunningPods) > 0 {
+		for _, p := range nonrunningPods {
+			fmt.Println("\u2717 Not running - " + p)
+		}
+		// TODO transition for non-running pods
+	} else {
+		fmt.Println("\u2713 All pods are running.")
+		k.fsm.Change("checkReadyPods")
+	}
 	return nil
 }
 
 func (k *Kubetrbl) checkReadyPods() error {
-	for _, pod := range k.pods.Items {
-		status := pod.Status
-		for _, c := range status.Conditions {
-			if c.Type == corev1.PodReady && c.Status != corev1.ConditionTrue {
-				fmt.Println("### Not ready - " + pod.GetName())
-				// TODO transition to not ready checks
-				return nil
-			}
-		}
+	notReadyPods, err := k.k8sContext.GetNotReadyPods()
+	if err != nil {
+		return err
 	}
-	fmt.Println("\u2713 All pods are ready.")
-	//k.fsm.Change("getPodName")
-	k.fsm.Change("getServiceName")
+
+	if len(notReadyPods) > 0 {
+		for _, p := range notReadyPods {
+			fmt.Println("\u2717 Not ready - " + p)
+		}
+		// TODO transition for non-running pods
+	} else {
+		fmt.Println("\u2713 All pods are ready.")
+		k.fsm.Change("getServiceName")
+	}
 	return nil
 }
 
 func (k *Kubetrbl) getServiceName() error {
-	svcs, err := k.k8sClient.CoreV1().Services(k.namespace).List(context.TODO(), metav1.ListOptions{})
+	svcs, err := k.k8sContext.k8sClient.CoreV1().Services(k.k8sContext.namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
@@ -239,7 +232,7 @@ func (k *Kubetrbl) getServicePort() error {
 
 func (k *Kubetrbl) getControllerWorkload() error {
 	k8sName := k.svc.Spec.Selector["app.kubernetes.io/name"]
-	deployment, err := k.k8sClient.AppsV1().Deployments(k.namespace).Get(context.TODO(), k8sName, metav1.GetOptions{})
+	deployment, err := k.k8sContext.k8sClient.AppsV1().Deployments(k.k8sContext.namespace).Get(context.TODO(), k8sName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -268,7 +261,7 @@ func (k *Kubetrbl) getControllerPods() error {
 	// our target is based off the controller
 	tgt := k.controller.Labels["app.kubernetes.io/name"]
 	result := []corev1.Pod{}
-	for _, p := range k.pods.Items {
+	for _, p := range k.k8sContext.pods {
 		pos := p.Labels["app.kubernetes.io/name"]
 		if tgt == pos {
 			result = append(result, p)
@@ -280,23 +273,7 @@ func (k *Kubetrbl) getControllerPods() error {
 }
 
 func (k *Kubetrbl) validateContainerPort() error {
-	// TODO this hack matches that in k8s.io/kubectl/pkg/cmd/util/kubectl_match_version.go
-	if nil == k.config.GroupVersion {
-		k.config.GroupVersion = &schema.GroupVersion{Group: "", Version: "v1"}
-	}
-
-	if k.config.APIPath == "" {
-		k.config.APIPath = "/api"
-	}
-	if k.config.NegotiatedSerializer == nil {
-		// This codec factory ensures the resources are not converted. Therefore, resources
-		// will not be round-tripped through internal versions. Defaulting does not happen
-		// on the client.
-		k.config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
-	}
-	// TODO end hack
-
-	client, err := rest.RESTClientFor(k.config)
+	client, err := rest.RESTClientFor(k.k8sContext.config)
 	if err != nil {
 		return err
 	}
@@ -305,14 +282,14 @@ func (k *Kubetrbl) validateContainerPort() error {
 		fmt.Printf("Checking accessibility of port for pod '%s'.\n", pod.Name)
 		req := client.Post().
 			Resource("pods").
-			Namespace(k.namespace).
+			Namespace(k.k8sContext.namespace).
 			Name(pod.Name).
 			SubResource("portforward")
 
 		// TODO retrieve local port from user
 		portMapping := []string{fmt.Sprintf("%d:%d", 8080, k.containerPort.ContainerPort)}
 
-		transport, upgrader, err := spdy.RoundTripperFor(k.config)
+		transport, upgrader, err := spdy.RoundTripperFor(k.k8sContext.config)
 		dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", req.URL())
 		stopChan := make(chan struct{}, 1)
 		readyChan := make(chan struct{})
